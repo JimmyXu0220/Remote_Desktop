@@ -5,17 +5,15 @@
 #include <string.h>
 #include <stdio.h>
 
-// typedef struct SampleData {
-//     int16_t value;      // The audio sample
-//     int ref_count;      // How many nodes share this sample
-// } SampleData;
+typedef struct SampleData {
+    int16_t value;      // The audio sample
+    int ref_count;      // How many nodes share this sample
+} SampleData;
 
 // A track is a singly linked list of Nodes.
 typedef struct Node {
-    int16_t value;
-    int16_t ref_count;
+    SampleData* sample_ptr;
     bool is_child;
-    // bool owns_sample; //true if this node owns its sample (and must free it)
     struct Node* next;
 } Node;
 
@@ -25,15 +23,10 @@ typedef struct sound_seg {
     size_t length;      // how many samples in total
 }Track;
 
-// SampleData* getSample(Node* node) {
-//     return node->sample_ptr;
-// }
+SampleData* getSample(Node* node) {
+    return node->sample_ptr;
+}
 
-// bool is_combined(Node* node) {
-//     // If the sample_ptr is exactly at the address right after the Node,
-//     // then it was allocated in a combined block.
-//     return ((uintptr_t)node->sample_ptr == (uintptr_t)node + sizeof(Node));
-// }
 
 // Load a WAV file into buffer
 void wav_load(const char* filename, int16_t* dest){
@@ -83,9 +76,6 @@ void tr_destroy(struct sound_seg* track) {
     Node* curr = track->head;
     while (curr) {
         Node* next_node = curr->next;
-        // if(curr->owns_sample && !is_combined(curr)){
-        //     free(curr->sample_ptr);
-        // }
         // Decrement ref_count; if 0, free the SampleData
         // curr->sample_ptr->ref_count--;
         // if (curr->is_child && curr->sample_ptr->ref_count == 0) {
@@ -110,7 +100,7 @@ void tr_read(struct sound_seg* track, int16_t* dest, size_t pos, size_t len) {
     }
 
     for (size_t i = 0; i < len && curr != NULL; i++) {
-        dest[i] = curr->value;
+        dest[i] = curr->sample_ptr->value;
         curr = curr->next;
     }
 }
@@ -130,27 +120,34 @@ void tr_write(struct sound_seg* track, int16_t* src, size_t pos, size_t len) {
         idx++;
     }
 
-    // For each sample to write:
     for (size_t i = 0; i < len; i++) {
         // If we're off the end, create a new node
-        if (!curr) {
-            Node* new_node = malloc(sizeof(Node));
-            new_node->value = 0;
-            new_node->ref_count = 1; // brand new sample
+        if (curr == NULL) {
+            // Allocate one block for Node + SampleData
+            Node* new_node = (Node*)malloc(sizeof(Node) + sizeof(SampleData));
             new_node->is_child = false;
+
+            // The sample is directly after the Node in memory
+            SampleData* smp = (SampleData*)(new_node + 1);
+            smp->value = 0;
+            smp->ref_count = 1;
+
+            new_node->sample_ptr = smp;
             new_node->next = NULL;
 
             if (!prev) {
-                track->head = new_node;
+                t->head = new_node;
             } else {
                 prev->next = new_node;
             }
             curr = new_node;
-            track->length++;
+            t->length++;
         }
-        // Overwrite the sample
-        curr->value = src[i];
-        // Advance
+
+        // Overwrite the existing sample
+        SampleData* sample = getSample(curr);
+        sample->value = src[i];
+
         prev = curr;
         curr = curr->next;
         idx++;
@@ -171,21 +168,19 @@ bool tr_delete_range(struct sound_seg* track, size_t pos, size_t len) {
     // If a parent node (is_child == false) is shared (ref_count > 1), deletion fails.
     Node* temp_check = curr;
     for (size_t i = 0; i < len && temp_check != NULL; i++) {
-        if (!temp_check->is_child && temp_check->ref_count > 1) {
+        if (!temp_check->is_child && temp_check->sample_ptr->ref_count > 1) {
             return false;
         }
         temp_check = temp_check->next;
     }
 
     // Delete len nodes from the track
-    for (size_t i = 0; i < len && curr; i++) {
+    for (size_t i = 0; i < len && curr != NULL; i++) {
         Node* temp = curr;
         curr = curr->next;
 
         // Decrement reference count
-        // if (!temp->is_child){
-            temp->ref_count--;
-        //}
+        temp->sample_ptr->ref_count--;
         // Only free sample_ptr if this is a child node
         // if (temp->is_child) {
         //     if (temp->sample_ptr->ref_count == 0) {
@@ -213,7 +208,7 @@ char* tr_identify(struct sound_seg* target, struct sound_seg* ad) {
     double ref_corr = 0.0;
     Node* ad_ptr = ad->head;
     while (ad_ptr != NULL) {
-        double val = (double)ad_ptr->value;
+        double val = (double)ad_ptr->sample_ptr->value;
         ref_corr += val * val;
         ad_ptr = ad_ptr->next;
     }
@@ -244,8 +239,8 @@ char* tr_identify(struct sound_seg* target, struct sound_seg* ad) {
         double match_corr = 0.0;
 
         for (size_t j = 0; j < ad->length && match_ptr != NULL; j++) {
-            double a_val = (double)a_ptr->value;
-            double t_val = (double)match_ptr->value;
+            double a_val = (double)a_ptr->sample_ptr->value;
+            double t_val = (double)match_ptr->sample_ptr->value;
             match_corr += a_val * t_val;
 
             a_ptr = a_ptr->next;
@@ -308,13 +303,13 @@ void tr_insert(struct sound_seg* src_track,
     Node* temp = src_curr;
     for (size_t i = 0; i < len && temp != NULL; i++) {
         // Increment ref_count since this sample is now shared
-        temp->ref_count++;
+        temp->sample_ptr->ref_count++;
+
         // Create new node and mark it as a child.
         Node* new_node = (Node*)malloc(sizeof(Node));
-        new_node->value = temp->value;
-        new_node->is_child = true; //as child
-        new_node->ref_count = temp->ref_count;
+        new_node->sample_ptr = temp->sample_ptr;
         new_node->next = NULL;
+        new_node->is_child = true;  // <<–– This line is the key change
 
         if (shared_head == NULL) {
             shared_head = new_node;
